@@ -20,7 +20,7 @@ read_input_yn() {
 }
 
 REPO_URL="https://github.com/rijiiokun-wq/vless-shopbot_new.git"
-PROJECT_DIR="vless-shopbot"
+PROJECT_DIR="vless-shopbot_new"
 NGINX_CONF_FILE="/etc/nginx/sites-available/${PROJECT_DIR}.conf"
 
 echo -e "${GREEN}--- Запуск скрипта установки/обновления VLESS Shop Bot ---${NC}"
