@@ -69,7 +69,8 @@ def initialize_db():
                     host_url TEXT NOT NULL,
                     host_username TEXT NOT NULL,
                     host_pass TEXT NOT NULL,
-                    host_inbound_id INTEGER NOT NULL
+                    host_inbound_id INTEGER NOT NULL,
+                    sales_enabled INTEGER NOT NULL DEFAULT 1
                 )
             ''')
             cursor.execute('''
@@ -81,7 +82,8 @@ def initialize_db():
                     price REAL NOT NULL,
                     FOREIGN KEY (host_name) REFERENCES xui_hosts (host_name)
                 )
-            ''')            
+            ''')
+            run_migration()
             default_settings = {
                 "panel_login": "admin",
                 "panel_password": "admin",
@@ -118,7 +120,6 @@ def initialize_db():
                 "ios_url": "https://telegra.ph/Instrukcii-ios-11-09",
                 "linux_url": "https://telegra.ph/Instrukciya-Linux-11-09",
             }
-            run_migration()
             for key, value in default_settings.items():
                 cursor.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
             conn.commit()
@@ -137,47 +138,49 @@ def run_migration():
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
 
+        # --- users migration ---
         logging.info("The migration of the table 'users' ...")
-    
+
         cursor.execute("PRAGMA table_info(users)")
         columns = [row[1] for row in cursor.fetchall()]
-        
+
         if 'referred_by' not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
             logging.info(" -> The column 'referred_by' is successfully added.")
         else:
             logging.info(" -> The column 'referred_by' already exists.")
-            
+
         if 'referral_balance' not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN referral_balance REAL DEFAULT 0")
             logging.info(" -> The column 'referral_balance' is successfully added.")
         else:
             logging.info(" -> The column 'referral_balance' already exists.")
-        
+
         if 'referral_balance_all' not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN referral_balance_all REAL DEFAULT 0")
             logging.info(" -> The column 'referral_balance_all' is successfully added.")
         else:
             logging.info(" -> The column 'referral_balance_all' already exists.")
-        
+
         logging.info("The table 'users' has been successfully updated.")
 
         logging.info("The migration of the table 'Transactions' ...")
-
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
         table_exists = cursor.fetchone()
 
         if table_exists:
             cursor.execute("PRAGMA table_info(transactions)")
             trans_columns = [row[1] for row in cursor.fetchall()]
-            
+
             if 'payment_id' in trans_columns and 'status' in trans_columns and 'username' in trans_columns:
                 logging.info("The 'Transactions' table already has a new structure. Migration is not required.")
             else:
                 backup_name = f"transactions_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                logging.warning(f"The old structure of the TRANSACTIONS table was discovered. I rename in '{backup_name}' ...")
+                logging.warning(
+                    f"The old structure of the TRANSACTIONS table was discovered. I rename in '{backup_name}' ..."
+                )
                 cursor.execute(f"ALTER TABLE transactions RENAME TO {backup_name}")
-                
+
                 logging.info("I create a new table 'Transactions' with the correct structure ...")
                 create_new_transactions_table(cursor)
                 logging.info("The new table 'Transactions' has been successfully created. The old data is saved.")
@@ -186,10 +189,23 @@ def run_migration():
             create_new_transactions_table(cursor)
             logging.info("The new table 'Transactions' has been successfully created.")
 
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='xui_hosts'")
+        if cursor.fetchone():
+            cursor.execute("PRAGMA table_info(xui_hosts)")
+            host_columns = [row[1] for row in cursor.fetchall()]
+            if 'sales_enabled' not in host_columns:
+                cursor.execute(
+                    "ALTER TABLE xui_hosts ADD COLUMN sales_enabled INTEGER NOT NULL DEFAULT 1"
+                )
+                logging.info(" -> The column 'sales_enabled' is successfully added to xui_hosts.")
+            else:
+                logging.info(" -> The column 'sales_enabled' already exists in xui_hosts.")
+        else:
+            logging.warning(" -> Table 'xui_hosts' does not exist yet; skipping sales_enabled migration.")
+
         conn.commit()
         conn.close()
-        
-        logging.info("--- The database is successfully completed! ---")
+        logging.info("--- The database migration is successfully completed! ---")
 
     except sqlite3.Error as e:
         logging.error(f"An error occurred during migration: {e}")
@@ -216,7 +232,12 @@ def create_host(name: str, url: str, user: str, passwd: str, inbound: int):
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO xui_hosts (host_name, host_url, host_username, host_pass, host_inbound_id) VALUES (?, ?, ?, ?, ?)",
+                """
+                INSERT INTO xui_hosts
+                    (host_name, host_url, host_username, host_pass, host_inbound_id, sales_enabled)
+                VALUES
+                    (?, ?, ?, ?, ?, 1)
+                """,
                 (name, url, user, passwd, inbound)
             )
             conn.commit()
@@ -224,17 +245,77 @@ def create_host(name: str, url: str, user: str, passwd: str, inbound: int):
     except sqlite3.Error as e:
         logging.error(f"Error creating host '{name}': {e}")
 
-def delete_host(host_name: str):
+def set_host_sales_enabled(host_name: str, enabled: int) -> bool:
+    """Soft-disable / enable sales for a host. enabled: 0/1"""
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM plans WHERE host_name = ?", (host_name,))
-            cursor.execute("DELETE FROM xui_hosts WHERE host_name = ?", (host_name,))
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE xui_hosts SET sales_enabled = ? WHERE host_name = ?",
+                (1 if enabled else 0, host_name)
+            )
             conn.commit()
-            logging.info(f"Successfully deleted host '{host_name}' and its plans.")
+            updated = cur.rowcount > 0
+            if not updated:
+                logger.warning(f"set_host_sales_enabled: host not found: {host_name}")
+            return updated
     except sqlite3.Error as e:
-        logging.error(f"Error deleting host '{host_name}': {e}")
+        logger.error(f"set_host_sales_enabled error for host '{host_name}': {e}")
+        return False
 
+
+def host_has_keys(host_name: str) -> bool:
+    """Returns True if there is at least one key linked to this host."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM vpn_keys WHERE host_name = ? LIMIT 1",
+                (host_name,)
+            )
+            return cur.fetchone() is not None
+    except sqlite3.Error as e:
+        logger.error(f"host_has_keys error for host '{host_name}': {e}")
+        return True  # safer default: forbid hard delete on errors
+
+
+def hard_delete_host(host_name: str) -> bool:
+    """
+    Hard delete host + plans.
+    Allowed ONLY if host has no keys. Returns True if deleted.
+    """
+    try:
+        if host_has_keys(host_name):
+            logger.warning(f"hard_delete_host blocked: host '{host_name}' still has keys.")
+            return False
+
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM plans WHERE host_name = ?", (host_name,))
+            cur.execute("DELETE FROM xui_hosts WHERE host_name = ?", (host_name,))
+            conn.commit()
+            deleted = cur.rowcount > 0
+            if deleted:
+                logger.info(f"hard_delete_host: deleted host '{host_name}'")
+            else:
+                logger.warning(f"hard_delete_host: host not found '{host_name}'")
+            return deleted
+    except sqlite3.Error as e:
+        logger.error(f"hard_delete_host error for host '{host_name}': {e}")
+        return False
+
+
+def get_sales_enabled_hosts() -> list[dict]:
+    """Hosts available for selling (sales_enabled=1)."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM xui_hosts WHERE sales_enabled = 1 ORDER BY host_name")
+            return [dict(r) for r in cur.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"get_sales_enabled_hosts error: {e}")
+        return []
 def get_host(host_name: str) -> dict | None:
     try:
         with sqlite3.connect(DB_FILE) as conn:

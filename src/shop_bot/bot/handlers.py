@@ -1,13 +1,13 @@
 import logging
 import uuid
 import qrcode
-import aiohttp
 import re
 import aiohttp
 import hashlib
 import json
 import base64
 import asyncio
+import base64
 
 from urllib.parse import urlencode
 from hmac import compare_digest
@@ -39,7 +39,7 @@ from shop_bot.data_manager.database import (
     update_key_info, set_trial_used, set_terms_agreed, get_setting, get_all_hosts,
     get_plans_for_host, get_plan_by_id, log_transaction, get_referral_count,
     add_to_referral_balance, create_pending_transaction, get_all_users,
-    set_referral_balance, set_referral_balance_all
+    set_referral_balance, set_referral_balance_all, get_sales_enabled_hosts,
 )
 
 from shop_bot.config import (
@@ -149,45 +149,42 @@ def get_user_router() -> Router:
         terms_url = get_setting("terms_url")
         privacy_url = get_setting("privacy_url")
         channel_url = get_setting("channel_url")
-
-        if not channel_url or not terms_url or not privacy_url:
-            set_terms_agreed(user_id)
-            await show_main_menu(message)
-            return
-
         is_subscription_forced = get_setting("force_subscription") == "true"
-        
-        show_welcome_screen = (is_subscription_forced and channel_url) or (terms_url and privacy_url)
 
-        if not show_welcome_screen:
+        has_terms_block = bool(terms_url or privacy_url)
+        has_channel_block = bool(is_subscription_forced and channel_url)
+
+        # Если нечего показывать — пропускаем онбординг
+        if not has_terms_block and not has_channel_block:
             set_terms_agreed(user_id)
             await show_main_menu(message)
             return
 
         welcome_parts = ["<b>Добро пожаловать!</b>\n"]
-        
-        if is_subscription_forced and channel_url:
+
+        if has_channel_block:
             welcome_parts.append("Для доступа ко всем функциям, пожалуйста, подпишитесь на наш канал.\n")
-        
-        if terms_url:
+
+        if terms_url and privacy_url:
+            welcome_parts.append(
+                "Также необходимо ознакомиться с нашими Условиями использования и Политикой конфиденциальности.")
+        elif terms_url:
             welcome_parts.append("Также необходимо ознакомиться и принять наши Условия использования.")
         elif privacy_url:
             welcome_parts.append("Также необходимо ознакомиться с нашей Политикой конфиденциальности.")
-        elif terms_url and privacy_url:
-            welcome_parts.append("Также необходимо ознакомиться с нашими Условиями использования и Политикой конфиденциальности.")
 
         welcome_parts.append("\nПосле этого нажмите кнопку ниже.")
         final_text = "\n".join(welcome_parts)
-        
+
         await message.answer(
             final_text,
             reply_markup=keyboards.create_welcome_keyboard(
                 channel_url=channel_url,
                 is_subscription_forced=is_subscription_forced,
                 terms_url=terms_url,
-                privacy_url=privacy_url
+                privacy_url=privacy_url,
             ),
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
         )
         await state.set_state(Onboarding.waiting_for_subscription_and_agreement)
 
@@ -578,7 +575,7 @@ def get_user_router() -> Router:
             await callback.answer("Вы уже использовали бесплатный пробный период.", show_alert=True)
             return
 
-        hosts = get_all_hosts()
+        hosts = get_sales_enabled_hosts()
         if not hosts:
             await callback.message.edit_text("❌ В данный момент нет доступных серверов для создания пробного ключа.")
             return
@@ -654,9 +651,9 @@ def get_user_router() -> Router:
             connection_string = details['connection_string']
             expiry_date = datetime.fromisoformat(key_data['expiry_date'])
             created_date = datetime.fromisoformat(key_data['created_date'])
-            
-            all_user_keys = get_user_keys(user_id)
-            key_number = next((i + 1 for i, key in enumerate(all_user_keys) if key['key_id'] == key_id_to_show), 0)
+
+            all_user_keys = sorted(get_user_keys(user_id), key=lambda k: k["key_id"])
+            key_number = next((i + 1 for i, key in enumerate(all_user_keys) if key["key_id"] == key_id_to_show), 0)
             
             final_text = get_key_info_text(key_number, expiry_date, created_date, connection_string)
             
@@ -735,29 +732,34 @@ def get_user_router() -> Router:
     @registration_required
     async def buy_new_key_handler(callback: types.CallbackQuery):
         await callback.answer()
-        hosts = get_all_hosts()
+
+        hosts = get_sales_enabled_hosts()  # <-- важно: только включенные для продаж
         if not hosts:
             await callback.message.edit_text("❌ В данный момент нет доступных серверов для покупки.")
             return
-        
+
+        plans_by_host: dict[str, list[dict]] = {}
+        for host in hosts:
+            host_name = host["host_name"]
+            plans = get_plans_for_host(host_name)
+            if plans:
+                plans_by_host[host_name] = plans
+
+        if not plans_by_host:
+            await callback.message.edit_text("❌ В данный момент нет доступных тарифов для покупки.")
+            return
+
         await callback.message.edit_text(
-            "Выберите сервер, на котором хотите приобрести ключ:",
-            reply_markup=keyboards.create_host_selection_keyboard(hosts, action="new")
+            "Выберите тариф для нового ключа:",
+            reply_markup=keyboards.create_plans_keyboard_all_hosts(plans_by_host, action="new")
         )
 
     @user_router.callback_query(F.data.startswith("select_host_new_"))
     @registration_required
     async def select_host_for_purchase_handler(callback: types.CallbackQuery):
         await callback.answer()
-        host_name = callback.data[len("select_host_new_"):]
-        plans = get_plans_for_host(host_name)
-        if not plans:
-            await callback.message.edit_text(f"❌ Для сервера \"{host_name}\" не настроены тарифы.")
-            return
-        await callback.message.edit_text(
-            "Выберите тариф для нового ключа:", 
-            reply_markup=keyboards.create_plans_keyboard(plans, action="new", host_name=host_name)
-        )
+        # шаг выбора хоста выключен — перекидываем на общий выбор тарифов
+        await buy_new_key_handler(callback)
 
     @user_router.callback_query(F.data.startswith("extend_key_"))
     @registration_required
@@ -821,6 +823,29 @@ def get_user_router() -> Router:
         )
         await state.set_state(PaymentProcess.waiting_for_email)
 
+    @user_router.callback_query(F.data.startswith("buyh_"))
+    @registration_required
+    async def plan_selection_handler_host_encoded(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer()
+
+        # buyh_{host_enc}_{plan_id}_{action}_{key_id}
+        _, host_enc, plan_id, action, key_id = callback.data.split("_", 4)
+
+        host_name = keyboards._dec_host(host_enc)  # или вынеси decode в отдельный util, не дергай keyboards приватно
+        await state.update_data(
+            action=action,
+            key_id=int(key_id),
+            plan_id=int(plan_id),
+            host_name=host_name,
+        )
+
+        await callback.message.edit_text(
+            "📧 Пожалуйста, введите ваш email для отправки чека об оплате.\n\n"
+            "Если вы не хотите указывать почту, нажмите кнопку ниже.",
+            reply_markup=keyboards.create_skip_email_keyboard()
+        )
+        await state.set_state(PaymentProcess.waiting_for_email)
+
     @user_router.callback_query(PaymentProcess.waiting_for_email, F.data == "back_to_plans")
     async def back_to_plans_handler(callback: types.CallbackQuery, state: FSMContext):
         data = await state.get_data()
@@ -840,17 +865,7 @@ def get_user_router() -> Router:
         if is_valid_email(message.text):
             await state.update_data(customer_email=message.text)
             await message.answer(f"✅ Email принят: {message.text}")
-
-            data = await state.get_data()
-            await message.answer(
-                CHOOSE_PAYMENT_METHOD_MESSAGE,
-                reply_markup=keyboards.create_payment_method_keyboard(
-                    payment_methods=PAYMENT_METHODS,
-                    action=data.get('action'),
-                    key_id=data.get('key_id')
-                )
-            )
-            await state.set_state(PaymentProcess.waiting_for_payment_method)
+            await show_payment_options(message, state)
             logger.info(f"User {message.chat.id}: State set to waiting_for_payment_method")
         else:
             await message.answer("❌ Неверный формат email. Попробуйте еще раз.")
@@ -860,57 +875,49 @@ def get_user_router() -> Router:
         await callback.answer()
         await state.update_data(customer_email=None)
 
-        data = await state.get_data()
-        await callback.message.edit_text(
-            CHOOSE_PAYMENT_METHOD_MESSAGE,
-            reply_markup=keyboards.create_payment_method_keyboard(
-                payment_methods=PAYMENT_METHODS,
-                action=data.get('action'),
-                key_id=data.get('key_id')
-            )
-        )
-        await state.set_state(PaymentProcess.waiting_for_payment_method)
+        await show_payment_options(callback.message, state)
         logger.info(f"User {callback.from_user.id}: State set to waiting_for_payment_method")
 
     async def show_payment_options(message: types.Message, state: FSMContext):
         data = await state.get_data()
         user_data = get_user(message.chat.id)
         plan = get_plan_by_id(data.get('plan_id'))
-        
+
         if not plan:
-            await message.edit_text("❌ Ошибка: Тариф не найден.")
+            await message.answer("❌ Ошибка: Тариф не найден.")
             await state.clear()
             return
 
         price = Decimal(str(plan['price']))
         final_price = price
-        discount_applied = False
         message_text = CHOOSE_PAYMENT_METHOD_MESSAGE
 
         if user_data.get('referred_by') and user_data.get('total_spent', 0) == 0:
             discount_percentage_str = get_setting("referral_discount") or "0"
             discount_percentage = Decimal(discount_percentage_str)
-            
             if discount_percentage > 0:
                 discount_amount = (price * discount_percentage / 100).quantize(Decimal("0.01"))
                 final_price = price - discount_amount
-
                 message_text = (
-                    f"🎉 Как приглашенному пользователю, на вашу первую покупку предоставляется скидка {discount_percentage_str}%!\n"
-                    f"Старая цена: <s>{price:.2f} RUB</s>\n"
-                    f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
-                ) + CHOOSE_PAYMENT_METHOD_MESSAGE
+                                   f"🎉 Как приглашенному пользователю, на вашу первую покупку предоставляется скидка {discount_percentage_str}%!\n"
+                                   f"Старая цена: <s>{price:.2f} RUB</s>\n"
+                                   f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
+                               ) + CHOOSE_PAYMENT_METHOD_MESSAGE
 
         await state.update_data(final_price=float(final_price))
 
-        await message.edit_text(
-            message_text,
-            reply_markup=keyboards.create_payment_method_keyboard(
-                payment_methods=PAYMENT_METHODS,
-                action=data.get('action'),
-                key_id=data.get('key_id')
-            )
+        kb = keyboards.create_payment_method_keyboard(
+            payment_methods=PAYMENT_METHODS,
+            action=data.get('action'),
+            key_id=data.get('key_id')
         )
+
+        # если это сообщение бота — отредачим, иначе ответим новым
+        try:
+            await message.edit_text(message_text, reply_markup=kb)
+        except TelegramBadRequest:
+            await message.answer(message_text, reply_markup=kb)
+
         await state.set_state(PaymentProcess.waiting_for_payment_method)
         
     @user_router.callback_query(PaymentProcess.waiting_for_payment_method, F.data == "back_to_email_prompt")
@@ -1149,6 +1156,14 @@ def get_user_router() -> Router:
         else:
             await callback.message.edit_text("❌ Не удалось создать счет Heleket. Попробуйте другой способ оплаты.")
 
+    @user_router.message(F.text)
+    @registration_required
+    async def unknown_message_handler(message: types.Message):
+        if message.text.startswith('/'):
+            await message.answer("Такой команды не существует. Попробуйте /start.")
+        else:
+            await message.answer("Я не понимаю эту команду. Пожалуйста, используйте кнопки меню.")
+
     @user_router.callback_query(PaymentProcess.waiting_for_payment_method, F.data == "pay_tonconnect")
     async def create_ton_invoice_handler(callback: types.CallbackQuery, state: FSMContext):
         logger.info(f"User {callback.from_user.id}: Entered create_ton_invoice_handler.")
@@ -1219,13 +1234,6 @@ def get_user_router() -> Router:
             await callback.message.answer("❌ Не удалось создать ссылку для TON Connect. Попробуйте позже.")
             await state.clear()
 
-        @user_router.message(F.text)
-        @registration_required
-        async def unknown_message_handler(message: types.Message):
-            if message.text.startswith('/'):
-                await message.answer("Такой команды не существует. Попробуйте /start.")
-            else:
-                await message.answer("Я не понимаю эту команду. Пожалуйста, используйте кнопки меню.")
     return user_router
 
 _user_connectors: Dict[int, TonConnect] = {}
@@ -1327,7 +1335,6 @@ async def notify_admin_of_purchase(bot: Bot, metadata: dict):
 
         message_text = (
             "🎉 **Новая покупка!** 🎉\n\n"
-            f"👤 **Пользователь:** @{username} (ID: `{user_id}`)\n"
             f"🌍 **Сервер:** {host_name}\n"
             f"📄 **Тариф:** {plan_name}\n"
             f"💰 **Сумма:** {price:.2f} RUB\n"
@@ -1517,7 +1524,7 @@ async def process_successful_payment(bot: Bot, metadata: dict):
                     referrer_username = user_data.get('username', 'пользователь')
                     await bot.send_message(
                         referrer_id,
-                        f"🎉 Ваш реферал @{referrer_username} совершил покупку на сумму {price:.2f} RUB!\n"
+                        f"🎉 Ваш реферал совершил покупку на сумму {price:.2f} RUB!\n"
                         f"💰 На ваш баланс начислено вознаграждение: {reward:.2f} RUB."
                     )
                 except Exception as e:
@@ -1558,9 +1565,9 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         
         connection_string = result['connection_string']
         new_expiry_date = datetime.fromtimestamp(result['expiry_timestamp_ms'] / 1000)
-        
-        all_user_keys = get_user_keys(user_id)
-        key_number = next((i + 1 for i, key in enumerate(all_user_keys) if key['key_id'] == key_id), len(all_user_keys))
+
+        all_user_keys = sorted(get_user_keys(user_id), key=lambda k: k["key_id"])
+        key_number = next((i + 1 for i, key in enumerate(all_user_keys) if key["key_id"] == key_id), 0)
 
         final_text = get_purchase_success_text(
             action="создан" if action == "new" else "продлен",

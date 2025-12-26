@@ -1,4 +1,5 @@
 import logging
+import base64
 
 from datetime import datetime
 
@@ -77,9 +78,16 @@ def create_support_keyboard(support_user: str) -> InlineKeyboardMarkup:
 def create_host_selection_keyboard(hosts: list, action: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for host in hosts:
-        callback_data = f"select_host_{action}_{host['host_name']}"
-        builder.button(text=host['host_name'], callback_data=callback_data)
-    builder.button(text="⬅️ Назад", callback_data="manage_keys" if action == 'new' else "back_to_main_menu")
+        builder.button(text=host['host_name'], callback_data=f"select_host_{action}_{host['host_name']}")
+
+    if action == "trial":
+        back_cb = "back_to_main_menu"
+    elif action == "new":
+        back_cb = "buy_new_key"
+    else:
+        back_cb = "back_to_main_menu"
+
+    builder.button(text="⬅️ Назад", callback_data=back_cb)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -104,20 +112,59 @@ def create_payment_method_keyboard(payment_methods: dict, action: str, key_id: i
     builder = InlineKeyboardBuilder()
 
     if payment_methods and payment_methods.get("yookassa"):
-        if get_setting("sbp_enabled"):
+        if get_setting("sbp_enabled") == "true":
             builder.button(text="🏦 СБП / Банковская карта", callback_data="pay_yookassa")
         else:
             builder.button(text="🏦 Банковская карта", callback_data="pay_yookassa")
+
     if payment_methods and payment_methods.get("heleket"):
         builder.button(text="💎 Криптовалюта", callback_data="pay_heleket")
+
     if payment_methods and payment_methods.get("cryptobot"):
         builder.button(text="🤖 CryptoBot", callback_data="pay_cryptobot")
+
     if payment_methods and payment_methods.get("tonconnect"):
         callback_data_ton = "pay_tonconnect"
         logger.info(f"Creating TON button with callback_data: '{callback_data_ton}'")
         builder.button(text="🪙 TON Connect", callback_data=callback_data_ton)
 
+    builder.button(
+        text="📌 Как оплатить криптой (инструкция)",
+        url="https://t.me/+vzcFvrnqOO00ZjNi"
+    )
+
     builder.button(text="⬅️ Назад", callback_data="back_to_email_prompt")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def _enc_host(host: str) -> str:
+    return base64.urlsafe_b64encode(host.encode()).decode().rstrip("=")
+
+def _dec_host(s: str) -> str | None:
+    try:
+        pad = "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode((s + pad).encode()).decode()
+    except Exception:
+        logger.warning("Failed to decode host from callback: %r", s, exc_info=True)
+        return None
+
+def create_plans_keyboard_all_hosts(plans_by_host: dict[str, list[dict]], action: str = "new") -> InlineKeyboardMarkup:
+    """
+    Показывает список тарифов сразу по всем sales_enabled хостам.
+    В callback_data сохраняем host_name, чтобы дальше вся логика оплаты/создания ключа не ломалась.
+    """
+    builder = InlineKeyboardBuilder()
+
+    for host_name, plans in plans_by_host.items():
+        host_enc = _enc_host(host_name)
+        for plan in plans:
+            callback_data = f"buyh_{host_enc}_{plan['plan_id']}_{action}_0"
+            builder.button(
+                text=f"{plan['plan_name']} - {plan['price']:.0f} RUB",
+                callback_data=callback_data
+            )
+
+    builder.button(text="⬅️ Назад", callback_data="back_to_main_menu")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -134,7 +181,8 @@ def create_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
 def create_keys_management_keyboard(keys: list) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if keys:
-        for i, key in enumerate(keys):
+        keys_sorted = sorted(keys, key=lambda k: (k.get("created_date") or "", k["key_id"]))
+        for i, key in enumerate(keys_sorted):
             expiry_date = datetime.fromisoformat(key['expiry_date'])
             status_icon = "✅" if expiry_date > datetime.now() else "❌"
             host_name = key.get('host_name', 'Неизвестный хост')

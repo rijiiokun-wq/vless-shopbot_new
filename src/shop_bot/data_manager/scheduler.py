@@ -194,7 +194,8 @@ async def periodic_subscription_check(bot_controller: BotController):
         try:
             await sync_keys_with_panels()
 
-            if bot_controller.get_status().get("is_running"):
+            status = bot_controller.get_status()
+            if status.get("shop_bot_running"):
                 bot = bot_controller.get_bot_instance()
                 if bot:
                     await check_expiring_subscriptions(bot)
